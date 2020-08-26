@@ -1,0 +1,270 @@
+---
+title: "Aquatic Warming Stripes"
+author: "Matt Shank (@fwEco)"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output: 
+  rmarkdown::html_document:
+    theme: cerulean 
+runtime: shiny
+---
+
+<style>
+    body .main-container {
+        max-width: 1000px;
+    }
+</style>
+
+
+
+```{r setup, include=FALSE}
+source('script_analysis.R')
+source('shiny_1dropdown.R')
+library(knitr)
+# library(kableExtra)
+# library(dataRetrieval)
+library(tidyverse)
+library(leaflet)
+library(shiny)
+
+
+#knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r header, echo=FALSE, out.width = '100%', fig.align="center"}
+knitr::include_graphics("header.png")
+```
+
+
+
+I have been fascinated by [warming stripes plots](https://showyourstripes.info/), many of which can be seen via #ShowYourStripes on twitter. I think these plots are a simple but great way to visualize large amounts of temperature data - by showing yearly means through
+time. I've only seen these plots for air temperature data though, so I set out to visualize stream temperature data in the same format. 
+
+Below is my attempt. I first downloaded over 2.2 million water temperature observations. I then summarized the data to create warming stripes plots  224 streams and rivers that have been continuously monitoring water temperature for 10 years or more. If you'd like to browse around the country for sites available, check out the interactive map first (below). If you're interested in methods, read on (far below) for some R code and decisions I made along the way.
+
+
+```{r warm_shiny, echo=FALSE}
+shinyApp(ui, server, options = list(height = 500))
+```
+
+
+## Nationwide database of USGS stream gages that have been collecting stream temperature data for a long time (>10 years). 
+
+```{r gageTempMap, echo=FALSE, fig.width=10, fig.height=6}
+gageTempMap
+```
+
+<br>
+<br>
+
+# Methods
+<br>
+
+First I had to find out what data were available. I am a huge fan of the USGS dataRetrieval package, so I started
+there. Many thanks to @[DeCiccoDonk](https://twitter.com/DeCiccoDonk) and @[HydroHammond](https://twitter.com/HydroHammond) for help with the code it took 
+to get there.
+
+```{r code, echo = TRUE, eval = FALSE}
+
+all_sites <- data.frame()
+threshold <- 7300 # try 20 years of daily records for threshold
+for(st in stateCd$STUSAB) {
+  what_data <- whatNWISdata(stateCd = st,
+                            parameterCd='00010')
+  
+  what_data_filtered <- what_data %>%
+    filter(data_type_cd == 'dv', #daily values
+           stat_cd == '00003', #daily mean
+           count_nu > threshold) %>%
+    
+    arrange(desc(count_nu)) %>%
+    
+    select(site_no, station_nm, 
+           dec_long_va, 
+           dec_lat_va, 
+           begin_date, 
+           end_date, 
+           count_nu)
+  
+  all_sites <- bind_rows(all_sites, what_data_filtered)
+}
+```
+
+
+<br>
+
+## 218 sites across the USA have stream gage data for > 20 years
+<br>
+
+This step allowed me to identify what sites to target for a data download. After that, I used all the sites ('site_no')
+to make a vector of sites where I wanted to download data. 
+
+
+```{rdataRetrieval, echo = TRUE, eval = FALSE}
+# download USGS temp data -------------------------------------------------
+
+site_numbers <- unique(all_sites$site_no)
+length(site_numbers) # 218 --  8 sites were duplicated
+
+# save site info to a variable so we can look at it later
+site_info <- readNWISsite(site_numbers)
+
+# keep only relevant info and attach state abbrev and name
+site_info <- readNWISsite(site_numbers) %>% 
+  as_tibble() %>% 
+  select(site_no, station_nm, drain_area_va, dec_lat_va, dec_long_va, state_cd, county_cd, huc_cd, tz_cd) %>%
+  left_join(stateCd, by=setNames('STATE', 'state_cd')) %>% # join state abbrev and name
+  select(-STATENS) 
+
+# # define start and end dates
+start_date <- "1900-01-01" # earliest available appears to be 1964-10-01
+end_date <- Sys.Date() #through today (2020-08-24)
+
+#codes for parameters of interest
+readNWISpCode('00010') # water temperature in C
+
+### obtain usgs flow data 
+ 
+# avg daily retrieval of USGS data, use the readNWISdv function
+start_time <- Sys.time()
+gagedata <- readNWISdv(site_numbers, # trying all 218 at once... fingers crossed i got some chores lined up
+                        parameter_code,
+                        start_date, end_date)
+end_time <- Sys.time()
+ 
+## run time
+ end_time - start_time # Time difference of 1.7 hours for daily temp data from 218 gages
+```
+
+<br>
+<br>
+
+After cleaning up the data, I noticed there were MANY variants of USGS water temperature monitoring. Since water 
+temp is what we're after and the majority of the records are for Wtemp (94%), I decided to drop everything else 
+and add a year column (to summarize with later using lubridate()). I also kept only approved data (not provisional).
+<br>
+
+
+```{rdataRetrieval_clean, echo = TRUE, eval = FALSE}
+
+temp_df <- 
+  gagedata %>% 
+  as_tibble() %>% 
+  renameNWISColumns() %>% 
+  select(agency_cd, site_no, Date, Wtemp, Wtemp_cd) %>% # select only necessary cols
+  drop_na(Wtemp) %>%
+  filter(Wtemp_cd == 'A' &  Wtemp > -1 & Wtemp < 40) %>%  # keep only approved data and believable temps (only 5 obs >-1 & <40)
+  mutate(year = year(Date))
+```
+
+<br>
+<br>
+
+Next, I calcuated mean stream temperature by year for each site using dplyr::summarize. I also
+calculate a bunch of other stats (N, min, max, median, sd, minDate, maxDate). I decided to only keep
+yearly data with > 11 months worth of records. Missing data could influence the variable of interest 
+(mean yearly temperature), so this seemed like a conservative floor. I also kept only sites with a >= 10 year period of record.
+
+```{r_ddply, echo = TRUE, eval = FALSE}
+
+# calculate yearly temps --------------------------------------------------
+
+#first prepare site info df to join
+
+Wtempstats <-
+  temp_df %>% 
+  group_by(site_no, year) %>% 
+  summarize(
+    N    = sum(!is.na(Wtemp)),
+    min = min(Wtemp, na.rm = TRUE),
+    max = max(Wtemp, na.rm = TRUE),
+    median = median(Wtemp, na.rm = TRUE),
+    mean = mean(Wtemp, na.rm = TRUE),
+    sd   = sd(Wtemp, na.rm = TRUE),
+    minDate = min(Date, na.rm = TRUE),
+    maxDate = max(Date, na.rm = TRUE)) %>%
+  
+  mutate(no_months = N/30) %>%
+
+  left_join(site_info, by='site_no') %>%
+
+  filter(no_months >= 11) %>%  # keep only site-years with > 11 months of data
+  
+  ungroup() %>% 
+  
+  group_by(station_nm) %>%
+  
+  mutate(n_year = length(year),
+         state_site = paste0(STUSAB, ': ', station_nm)) %>%
+  
+  filter(n_year >= 10) %>%  # keep only stations with >= 10 years of data
+  
+  arrange(STUSAB, station_nm, year) 
+
+
+dim(Wtempstats) # 4352 records after keeping only sites with >= 11 months and >= 10 years of approved data
+length(unique(Wtempstats$site_no)) # 197 unique sites after filtering
+```
+<br>
+<br>
+
+After these steps were complete, I made a few static graphics to show the range of possibilities,
+then I created the 'Interactive graphic generator' of aquatic warming stripes plots shown above.
+
+<br>
+<br>
+
+## Static plots
+
+### Cold systems in the great white north are very cold in a relative sense, but are still getting warmer recently.
+```{r TERROR, echo=FALSE, out.width = '80%', fig.align="center"}
+knitr::include_graphics("TERROR R AT MOUTH NR KODIAK AK.png")
+```
+
+<br>
+
+### Warm systems in the southern US are definitely not as cold, but have also  definitely gotten warmer since ~ 1980.
+```{r Trinity, echo=FALSE, out.width = '80%', fig.align="center"}
+knitr::include_graphics("W Fk Trinity Rv at Grand Prairie, TX.png")
+```
+
+<br>
+
+### Meanwhile, there are sites directly downstream of a hypolimnetic reservoirs (bottom release dams) that are remarkably consistent.
+```{r WBDel, echo=FALSE, out.width = '80%', fig.align="center"}
+knitr::include_graphics("WEST BRANCH DELAWARE RIVER AT STILESVILLE NY.png")
+```
+
+<br>
+
+### Rivers in the Rocky Mountain West are also warming at a rapid pace.
+```{r Flathead, echo=FALSE, out.width = '80%', fig.align="center"}
+knitr::include_graphics("Flathead River at Columbia Falls MT.png")
+```
+<br>
+<br>
+
+My goal here is not to oversimplify. I realize there are a myriad of variables that contribute to water temperatures 
+in large watersheds. However, the overarching goal was to display long-term datasets in a consistent format. The takeaway for 
+me is that water temperatures are rising rapidly, much like air temperatures. As an aquatic biologist, this concerns me for
+many reasons. For one, temperatures are rising far faster than aquatic animals are able to adapt. I hope that we can reverse 
+this trend before more damage is done to our shared aquatic environments.
+
+If you have any questions on code contact me on twitter: @[fwEco](https://twitter.com/fwEco).
+
+<br>
+<br>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
